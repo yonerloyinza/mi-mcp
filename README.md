@@ -13,12 +13,12 @@ A Python MCP (Model Context Protocol) server that demonstrates core capabilities
 
 ## Arquitectura
 
-El servidor usa el transporte **Streamable HTTP** (`mcp.run(transport="streamable-http")`), lo que permite conexiones concurrentes sin el overhead de STDIO.
+El servidor admite **Streamable HTTP** y **STDIO**. HTTP es el transporte predeterminado; puedes elegirlo por instancia con `--transport` o mediante la variable `TRANSPORT`. Así puedes tener ambos transportes activos a la vez: inicia HTTP como servidor persistente y deja que el Inspector inicie su propio proceso STDIO. Los logs se escriben en `stderr`, dejando `stdout` disponible para los mensajes del protocolo STDIO.
 
 ```
 Cliente MCP (Kilo, VS Code, Inspector)
         │
-        │ HTTP/SSE
+        │ Streamable HTTP o STDIO
         │
 ├─► demo://welcome          [resource estático]
 ├─► demo://greeting/{name}  [resource template]
@@ -59,25 +59,52 @@ cp .env.example .env
 
 | Archivo | Propósito |
 |---|---|
-| `.env` | Variables: `HOST`, `PORT`, `LOG_LEVEL` |
+| `.env` | Valores predeterminados: `TRANSPORT`, `HOST`, `PORT`, `LOG_LEVEL` |
+| `.mcp-inspector.json` | Configura HTTP y STDIO para MCP Inspector |
 | `.vscode/mcp.json` | Configuración MCP para VS Code |
 | `.kilo/kilo.jsonc` | Configuración MCP para Kilo CLI |
 
 | Variable | Default | Uso |
 |---|---|---|
+| `TRANSPORT` | `streamable-http` | Transporte MCP: `streamable-http` o `stdio` |
 | `PORT` | `8080` | Puerto del servidor HTTP |
 | `HOST` | `0.0.0.0` | Dirección de escucha (server bind) |
 | `LOG_LEVEL` | `INFO` | Nivel de logging (debug, info, warning, error, critical) |
 
 ## Uso Rápido
 
-```bash
-# 1. Iniciar el servidor
-.venv/bin/python server.py
+### Streamable HTTP
 
-# 2. En otra terminal, ejecutar tests
+```bash
+# Iniciar el servidor HTTP (deja este proceso en ejecución)
+.venv/bin/python server.py --transport streamable-http
+
+# En otra terminal, ejecutar los tests HTTP
 .venv/bin/python test_client.py
 ```
+
+### STDIO
+
+Para probar el transporte STDIO directamente:
+
+```bash
+.venv/bin/python server.py --transport stdio
+```
+
+En Windows PowerShell:
+
+```powershell
+$env:TRANSPORT = "stdio"
+python server.py
+```
+
+Para usar **las dos variantes a la vez en MCP Inspector**, ejecuta el script desde cualquier directorio:
+
+```bash
+./run-inspector.sh
+```
+
+El script toma el puerto de la URL `demo-http` en [.mcp-inspector.json](./.mcp-inspector.json), inicia HTTP, espera a que esté disponible y luego ejecuta `npx @modelcontextprotocol/inspector --config .mcp-inspector.json`. Al cerrar el Inspector con `Ctrl+C`, también detiene el servidor HTTP. El archivo de configuración define ambos servidores: `demo-http` se conecta al proceso HTTP y `demo-stdio` inicia `server.py --transport stdio` como subproceso. El Inspector administra el ciclo de vida de ese proceso. Si no usas un entorno virtual `.venv`, asegúrate de que `python3` tenga instaladas las dependencias de [requirements.txt](./requirements.txt).
 
 ## Ejemplos de Uso
 
@@ -178,9 +205,11 @@ npx @modelcontextprotocol/inspector
 mi-mcp/
 ├── server.py              # Servidor MCP principal
 ├── test_client.py         # Tests end-to-end
+├── run-inspector.sh       # Inicia HTTP y MCP Inspector para probar ambos transportes
 ├── requirements.txt       # Dependencias
 ├── .env.example           # Template de variables de entorno
 ├── .env                   # Configuración local (no versionada)
+├── .mcp-inspector.json    # Configuración de HTTP y STDIO para MCP Inspector
 ├── README.md              # Este archivo
 ├── LICENSE                # MIT
 ├── .vscode/
@@ -195,5 +224,5 @@ mi-mcp/
 |---|---|
 | MCP SDK | mcp==2.3.0 |
 | Protocol Version | 2025-11-25 |
-| Transporte | Streamable HTTP |
+| Transporte | Streamable HTTP y STDIO |
 | Python | 3.10+ |

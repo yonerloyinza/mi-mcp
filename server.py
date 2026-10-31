@@ -1,3 +1,4 @@
+import argparse
 import logging
 import os
 import sys
@@ -23,10 +24,11 @@ greeting_styles = ["friendly", "formal", "funny"]
 logging.basicConfig(
     level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format='%(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]
+    handlers=[logging.StreamHandler(sys.stderr)]
 )
 logger = logging.getLogger(name)
 
+transport = os.environ.get("TRANSPORT", "streamable-http").lower()
 port = int(os.environ.get("PORT", 8080))
 host = os.environ.get("HOST", "0.0.0.0")
 
@@ -94,9 +96,23 @@ async def send_demo_log() -> str:
 
 
 if __name__ == "__main__":
-    logger.info(f"Starting MCP Server on port {port}...")
+    parser = argparse.ArgumentParser(description="Run the demo MCP server.")
+    parser.add_argument(
+        "--transport",
+        choices=("stdio", "streamable-http"),
+        default=transport,
+        help="MCP transport (defaults to TRANSPORT or streamable-http).",
+    )
+    transport = parser.parse_args().transport
+
+    logger.info(f"Starting MCP Server with {transport} transport...")
     try:
-        mcp.run(transport="streamable-http", host=host, port=port)
+        if transport == "stdio":
+            mcp.run(transport="stdio")
+        elif transport == "streamable-http":
+            mcp.run(transport="streamable-http", host=host, port=port)
+        else:
+            raise ValueError(f"Unsupported transport: {transport}")
     except Exception as e:
         logger.error(f"Server error: {str(e)}")
         sys.exit(1)

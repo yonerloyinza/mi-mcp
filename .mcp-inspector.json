@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "demo-http": {
+      "type": "http",
+      "url": "http://127.0.0.1:8001/mcp"
+    },
+    "demo-stdio": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["server.py", "--transport", "stdio"]
+    }
+  }
+}
