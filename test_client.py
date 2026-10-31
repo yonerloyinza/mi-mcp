@@ -10,6 +10,7 @@ import os
 import sys
 
 from dotenv import load_dotenv
+from httpx2 import AsyncClient
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.types import PromptReference, ResourceTemplateReference
@@ -25,84 +26,126 @@ EXPECTED_CAPABILITIES = {"tools", "resources", "prompts"}
 def report_success(feature: str) -> None:
     print(f"PASS: {feature}")
 
-async def run_checks(server_url: str) -> bool:
-    async with streamable_http_client(server_url) as (read_stream, write_stream):
-        async with ClientSession(read_stream, write_stream) as session:
-            initialized = await session.initialize()
-            
-            # Validar capabilities básicas expuestas por el servidor
-            capabilities = initialized.capabilities.model_dump(exclude_none=True) if initialized.capabilities else {}
-            missing_capabilities = EXPECTED_CAPABILITIES - capabilities.keys()
-            
-            if missing_capabilities:
+async def run_checks(server_url: str, token: str | None, auth_required: bool) -> bool:
+    if auth_required and not token:
+        print(
+            "FAIL: MCP_TOKEN is required when HTTP authentication is enabled.",
+            file=sys.stderr,
+        )
+        return False
+
+    async with AsyncClient(timeout=30.0) as http_client:
+        if auth_required:
+            unauthenticated_response = await http_client.get(server_url)
+            if unauthenticated_response.status_code != 401:
                 print(
-                    f"FAIL: Server is missing capabilities: {', '.join(sorted(missing_capabilities))}",
-                    file=sys.stderr,
-                )
-                print(
-                    f"Connected to {initialized.server_info.name!r}, version {initialized.server_info.version or '(not set)'}.",
+                    "FAIL: Requests without a token must receive HTTP 401.",
                     file=sys.stderr,
                 )
                 return False
 
-            assert initialized.server_info.name == "demo-mcp-server"
-            assert initialized.server_info.version == "1.0.0"
-            report_success(
-                f"initialize ({initialized.protocol_version}; {initialized.server_info.name} {initialized.server_info.version})"
+            invalid_token_response = await http_client.get(
+                server_url,
+                headers={"Authorization": f"Bearer {token}-invalid"},
             )
+            if invalid_token_response.status_code != 401:
+                print(
+                    "FAIL: Requests with an invalid token must receive HTTP 401.",
+                    file=sys.stderr,
+                )
+                return False
+            http_client.headers["Authorization"] = f"Bearer {token}"
+            report_success("authentication rejects missing and invalid tokens")
+        else:
+            unauthenticated_response = await http_client.get(server_url)
+            if unauthenticated_response.status_code == 401:
+                print(
+                    "FAIL: Requests without a token must not receive HTTP 401 when authentication is disabled.",
+                    file=sys.stderr,
+                )
+                return False
+            report_success("HTTP authentication is disabled")
+
+        async with streamable_http_client(server_url, http_client=http_client) as (
+            read_stream,
+            write_stream,
+        ):
+            async with ClientSession(read_stream, write_stream) as session:
+                initialized = await session.initialize()
+
+            # Validar capabilities básicas expuestas por el servidor
+                capabilities = initialized.capabilities.model_dump(exclude_none=True) if initialized.capabilities else {}
+                missing_capabilities = EXPECTED_CAPABILITIES - capabilities.keys()
+
+                if missing_capabilities:
+                    print(
+                        f"FAIL: Server is missing capabilities: {', '.join(sorted(missing_capabilities))}",
+                        file=sys.stderr,
+                    )
+                    print(
+                        f"Connected to {initialized.server_info.name!r}, version {initialized.server_info.version or '(not set)'}.",
+                        file=sys.stderr,
+                    )
+                    return False
+
+                assert initialized.server_info.name == "demo-mcp-server"
+                assert initialized.server_info.version == "1.0.0"
+                report_success(
+                    f"initialize ({initialized.protocol_version}; {initialized.server_info.name} {initialized.server_info.version})"
+                )
 
             # --- 1. TOOLS ---
-            tools = await session.list_tools()
-            tool_names = {tool.name for tool in tools.tools}
-            assert "add" in tool_names, f"Unexpected tools: {sorted(tool_names)}"
+                tools = await session.list_tools()
+                tool_names = {tool.name for tool in tools.tools}
+                assert "add" in tool_names, f"Unexpected tools: {sorted(tool_names)}"
             
-            add_result = await session.call_tool("add", {"a": 2, "b": 3})
-            assert not add_result.is_error, f"add returned an error: {add_result}"
+                add_result = await session.call_tool("add", {"a": 2, "b": 3})
+                assert not add_result.is_error, f"add returned an error: {add_result}"
             
             # El contenido en MCP regresa en una lista (.content)
-            assert add_result.content[0].text == "5" or "5" in add_result.content[0].text, f"Unexpected tool output: {add_result.content}"
-            report_success("tools/list and tools/call (add)")
+                assert add_result.content[0].text == "5" or "5" in add_result.content[0].text, f"Unexpected tool output: {add_result.content}"
+                report_success("tools/list and tools/call (add)")
 
             # --- 2. RESOURCES ---
-            resources = await session.list_resources()
-            resource_uris = {str(resource.uri) for resource in resources.resources}
-            assert "demo://welcome" in resource_uris, f"Unexpected resources: {sorted(resource_uris)}"
+                resources = await session.list_resources()
+                resource_uris = {str(resource.uri) for resource in resources.resources}
+                assert "demo://welcome" in resource_uris, f"Unexpected resources: {sorted(resource_uris)}"
             
-            welcome = await session.read_resource("demo://welcome")
-            assert welcome.contents[0].text == "Welcome to the demo MCP server."
+                welcome = await session.read_resource("demo://welcome")
+                assert welcome.contents[0].text == "Welcome to the demo MCP server."
             
-            templates = await session.list_resource_templates()
-            template_uris = {template.uri_template for template in templates.resource_templates}
-            assert "demo://greeting/{name}" in template_uris, f"Unexpected resource templates: {sorted(template_uris)}"
+                templates = await session.list_resource_templates()
+                template_uris = {template.uri_template for template in templates.resource_templates}
+                assert "demo://greeting/{name}" in template_uris, f"Unexpected resource templates: {sorted(template_uris)}"
             
-            greeting = await session.read_resource("demo://greeting/Ana")
-            assert greeting.contents[0].text == "Hello, Ana!"
-            report_success("resources/list, resources/templates/list, and resources/read")
+                greeting = await session.read_resource("demo://greeting/Ana")
+                assert greeting.contents[0].text == "Hello, Ana!"
+                report_success("resources/list, resources/templates/list, and resources/read")
 
             # --- 3. PROMPTS ---
-            prompts = await session.list_prompts()
-            prompt_names = {prompt.name for prompt in prompts.prompts}
-            assert "draft_greeting" in prompt_names, f"Unexpected prompts: {sorted(prompt_names)}"
+                prompts = await session.list_prompts()
+                prompt_names = {prompt.name for prompt in prompts.prompts}
+                assert "draft_greeting" in prompt_names, f"Unexpected prompts: {sorted(prompt_names)}"
             
-            prompt = await session.get_prompt("draft_greeting", {"name": "Maya", "style": "formal"})
-            assert prompt.messages[0].content.text == "Write a formal greeting for Maya."
-            report_success("prompts/list and prompts/get")
+                prompt = await session.get_prompt("draft_greeting", {"name": "Maya", "style": "formal"})
+                assert prompt.messages[0].content.text == "Write a formal greeting for Maya."
+                report_success("prompts/list and prompts/get")
 
             # --- 4. COMPLETIONS ---
-            prompt_completion = await session.complete(
-                ref=PromptReference(type="ref/prompt", name="draft_greeting"),
-                argument={"name": "style", "value": "f"},
-            )
-            assert prompt_completion.completion.values == ["friendly", "formal", "funny"], f"Unexpected prompt completions: {prompt_completion.completion.values}"
+                prompt_completion = await session.complete(
+                    ref=PromptReference(type="ref/prompt", name="draft_greeting"),
+                    argument={"name": "style", "value": "f"},
+                )
+                assert prompt_completion.completion.values == ["friendly", "formal", "funny"], f"Unexpected prompt completions: {prompt_completion.completion.values}"
             
-            resource_completion = await session.complete(
-                ref=ResourceTemplateReference(type="ref/resource", uri="demo://greeting/{name}"),
-                argument={"name": "name", "value": "a"},
-            )
-            assert resource_completion.completion.values == ["Ana"], f"Unexpected resource completions: {resource_completion.completion.values}"
-            report_success("completion/complete (prompt and resource template)")
+                resource_completion = await session.complete(
+                    ref=ResourceTemplateReference(type="ref/resource", uri="demo://greeting/{name}"),
+                    argument={"name": "name", "value": "a"},
+                )
+                assert resource_completion.completion.values == ["Ana"], f"Unexpected resource completions: {resource_completion.completion.values}"
+                report_success("completion/complete (prompt and resource template)")
 
-            return True
+                return True
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run modern end-to-end checks against the demo MCP server.")
@@ -117,15 +160,43 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override the port (reconstructs URL from HOST env + this port)",
     )
+    try:
+        auth_required = parse_bool(os.environ.get("AUTH_REQUIRED", "true"), "AUTH_REQUIRED")
+    except ValueError as error:
+        parser.error(str(error))
+    parser.add_argument(
+        "--require-auth",
+        action=argparse.BooleanOptionalAction,
+        default=auth_required,
+        help="Expect HTTP Bearer authentication (defaults to AUTH_REQUIRED).",
+    )
     return parser.parse_args()
+
+
+def parse_bool(value: str, setting: str) -> bool:
+    normalized = value.strip().casefold()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{setting} must be true or false.")
+
 
 def main() -> None:
     args = parse_args()
+    token = os.environ.get("MCP_TOKEN")
+    if args.require_auth and not token:
+        print(
+            "FAIL: Set MCP_TOKEN in .env when HTTP authentication is enabled.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
     if args.port is not None:
         host = os.environ.get("HOST", "127.0.0.1")
         args.url = f"http://{host}:{args.port}/mcp"
     print(f"Testing MCP server at {args.url}", flush=True)
-    if not asyncio.run(run_checks(args.url)):
+    if not asyncio.run(run_checks(args.url, token, args.require_auth)):
         raise SystemExit(1)
     print("All modern MCP feature checks passed.")
 

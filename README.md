@@ -52,14 +52,17 @@ pip install -r requirements.txt
 
 # Configurar el puerto (opcional)
 cp .env.example .env
-# Editar .env si necesitas un puerto diferente
+# Crear un token aleatorio (Linux/macOS)
+.venv/bin/python -c "import secrets; print(secrets.token_urlsafe(32))"
+# En Windows: .venv\Scripts\python.exe -c "import secrets; print(secrets.token_urlsafe(32))"
+# Copiar el resultado en MCP_TOKEN dentro de .env
 ```
 
 ### Configuración
 
 | Archivo | Propósito |
 |---|---|
-| `.env` | Valores predeterminados: `TRANSPORT`, `HOST`, `PORT`, `LOG_LEVEL` |
+| `.env` | Valores predeterminados: `TRANSPORT`, `HOST`, `PORT`, `LOG_LEVEL`, `AUTH_REQUIRED`, `MCP_TOKEN` |
 | `.mcp-inspector.json` | Configura HTTP y STDIO para MCP Inspector |
 | `.vscode/mcp.json` | Configuración MCP para VS Code |
 | `.kilo/kilo.jsonc` | Configuración MCP para Kilo CLI |
@@ -68,8 +71,41 @@ cp .env.example .env
 |---|---|---|
 | `TRANSPORT` | `streamable-http` | Transporte MCP: `streamable-http` o `stdio` |
 | `PORT` | `8080` | Puerto del servidor HTTP |
-| `HOST` | `0.0.0.0` | Dirección de escucha (server bind) |
+| `HOST` | `127.0.0.1` | Dirección de escucha (server bind) |
 | `LOG_LEVEL` | `INFO` | Nivel de logging (debug, info, warning, error, critical) |
+| `AUTH_REQUIRED` | `true` | Activa o desactiva la autenticación Bearer en HTTP |
+| `MCP_TOKEN` | *(requerido si `AUTH_REQUIRED=true`)* | Token Bearer aleatorio para proteger todas las solicitudes HTTP |
+
+`AUTH_REQUIRED=true` es el valor predeterminado. Puedes poner `AUTH_REQUIRED=false` en `.env` o iniciar el servidor con `--no-require-auth` para probar HTTP sin token; `--require-auth` lo activa. Si está activada, HTTP no arranca sin `MCP_TOKEN`. Genera un token distinto por entorno, guárdalo solo en `.env` (excluido de Git) o en el gestor de secretos de tu despliegue, y no lo compartas en logs ni en archivos de configuración versionados.
+
+Esta autenticación protege el transporte HTTP, donde el cliente envía `Authorization: Bearer ...`. No se aplica a STDIO: ahí el cliente inicia un proceso local y el control de acceso depende de quién puede ejecutarlo. La autenticación de la API externa que una herramienta pudiera consumir sería otra credencial, inyectada al proceso por `env` y utilizada por esa herramienta; este servidor de demostración no consume APIs externas ni usa un token en STDIO.
+
+El servidor escucha solo en la máquina local por defecto. Si lo expones a otra máquina, usa HTTPS (por ejemplo, detrás de un proxy TLS) y configura `HOST` para la interfaz de red correspondiente.
+
+### Variables de entorno heredadas
+
+Las variables definidas en la terminal, en VS Code o en otro proceso se heredan al iniciar Python y tienen prioridad sobre los valores de `.env`: `load_dotenv()` no las reemplaza por defecto. Si cambias `MCP_TOKEN` o `AUTH_REQUIRED` en `.env`, detén y reinicia el servidor para que tome la configuración nueva.
+
+Puedes comprobar si existen variables relevantes sin imprimir sus valores (Bash):
+
+```bash
+for var in MCP_TOKEN AUTH_REQUIRED HOST PORT; do
+  if [[ -v $var ]]; then
+    echo "$var: definida en el entorno"
+  else
+    echo "$var: no definida en el entorno"
+  fi
+done
+```
+
+Para iniciar el servidor con los valores de `.env`, elimina del entorno heredado las variables que pueden afectar a la autenticación y al puerto:
+
+```bash
+env -u MCP_TOKEN -u AUTH_REQUIRED -u HOST -u PORT \
+  .venv/bin/python server.py --transport streamable-http
+```
+
+El servidor carga entonces esas opciones desde `.env`. Esto no cambia las variables de la terminal actual ni afecta a procesos ya iniciados. También puedes limpiar la terminal actual con `unset MCP_TOKEN AUTH_REQUIRED HOST PORT`; no uses `env | grep TOKEN` para diagnosticar, porque mostraría el secreto.
 
 ## Uso Rápido
 
@@ -81,6 +117,51 @@ cp .env.example .env
 
 # En otra terminal, ejecutar los tests HTTP
 .venv/bin/python test_client.py
+```
+
+El cliente de prueba lee `AUTH_REQUIRED` y `MCP_TOKEN` de `.env`. Con autenticación habilitada, comprueba los rechazos HTTP 401 y continúa con el token válido; deshabilitada, verifica que HTTP funciona sin token. Puedes usar `--require-auth` o `--no-require-auth` para configurar el modo esperado por las pruebas.
+
+### Pruebas manuales con curl
+
+Con el servidor ejecutándose y `HOST=127.0.0.1`, `PORT=8001` en `.env`, desde la raíz del proyecto ejecuta:
+
+```bash
+./run-test.sh
+```
+
+El script lee `MCP_TOKEN` de `.env` y envía una solicitud MCP `initialize` a `http://127.0.0.1:8001/mcp`. Con autenticación habilitada, debe responder `HTTP 200 OK` (o `200`); el cuerpo contiene la respuesta JSON-RPC de inicialización. No guardes el token literal en el script ni lo pegues en la línea de comandos o en capturas.
+
+También puedes probar sin token usando curl. Esta solicitud debe responder `401 Unauthorized` si `AUTH_REQUIRED=true`:
+
+```bash
+curl -i -X POST http://127.0.0.1:8001/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"prueba-manual","version":"1.0"}}}'
+```
+
+Para probar `401` por token incorrecto, carga el valor desde `.env` sin imprimirlo y añade una cadena que lo invalide:
+
+```bash
+set -a
+source .env
+set +a
+curl -i -X POST http://127.0.0.1:8001/mcp \
+  -H "Authorization: Bearer ${MCP_TOKEN}-incorrecto" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"prueba-manual","version":"1.0"}}}'
+unset MCP_TOKEN
+```
+
+Si recibes `401` usando `./run-test.sh`, comprueba que reiniciaste el servidor después de cambiar `.env` y que no inició con un `MCP_TOKEN` heredado diferente. No hace falta mostrar el token para verificarlo: usa el bucle de diagnóstico anterior y reinicia con `env -u MCP_TOKEN ...`. El token que se haya pegado en un chat, archivo compartido o captura debe considerarse expuesto y reemplazarse en `.env`.
+
+Para probar HTTP sin autenticación sin editar `.env`:
+
+```bash
+AUTH_REQUIRED=false .venv/bin/python server.py --transport streamable-http
+# En otra terminal:
+AUTH_REQUIRED=false .venv/bin/python test_client.py
 ```
 
 ### STDIO
@@ -98,13 +179,15 @@ $env:TRANSPORT = "stdio"
 python server.py
 ```
 
+En STDIO no se envía un Bearer en los mensajes MCP. Si una herramienta necesita llamar a una API externa, el cliente puede inyectarle una variable de entorno al proceso hijo (por ejemplo, `API_BEARER_TOKEN`) y esa herramienta la usa en la cabecera de su petición saliente. `MCP_TOKEN` y `AUTH_REQUIRED` de este proyecto protegen/prueban el endpoint HTTP; no se usan como autenticación de STDIO ni como credenciales de una API externa. Actualmente el servidor demo no incluye llamadas a APIs externas.
+
 Para usar **las dos variantes a la vez en MCP Inspector**, ejecuta el script desde cualquier directorio:
 
 ```bash
 ./run-inspector.sh
 ```
 
-El script toma el puerto de la URL `demo-http` en [.mcp-inspector.json](./.mcp-inspector.json), inicia HTTP, espera a que esté disponible y luego ejecuta `npx @modelcontextprotocol/inspector --config .mcp-inspector.json`. Al cerrar el Inspector con `Ctrl+C`, también detiene el servidor HTTP. El archivo de configuración define ambos servidores: `demo-http` se conecta al proceso HTTP y `demo-stdio` inicia `server.py --transport stdio` como subproceso. El Inspector administra el ciclo de vida de ese proceso. Si no usas un entorno virtual `.venv`, asegúrate de que `python3` tenga instaladas las dependencias de [requirements.txt](./requirements.txt).
+El script toma el puerto de la URL `demo-http` en [.mcp-inspector.json](./.mcp-inspector.json), inicia HTTP y genera una configuración temporal del Inspector. Si `AUTH_REQUIRED=true`, añade el token a las solicitudes; si está en `false`, no lo requiere. La configuración temporal se elimina al cerrar el script. Al cerrar el Inspector con `Ctrl+C`, también detiene el servidor HTTP. `demo-stdio` inicia `server.py --transport stdio` como subproceso. Si no usas un entorno virtual `.venv`, asegúrate de que `python3` tenga instaladas las dependencias de [requirements.txt](./requirements.txt).
 
 ## Ejemplos de Uso
 
@@ -179,7 +262,7 @@ Verifica:
 
 ### VS Code
 
-El archivo `.vscode/mcp.json` registra el servidor. Si usas la extensión Kilo Code, abre VS Code en este directorio y el MCP aparecerá en la lista de servidores.
+El archivo [.vscode/mcp.json](./.vscode/mcp.json) registra el servidor y solicita un token al conectarse. Si `AUTH_REQUIRED=false`, puedes quitar la cabecera `Authorization` del archivo o introducir cualquier valor. Si usas la extensión Kilo Code, configura la cabecera solo cuando la autenticación esté habilitada.
 
 ### Kilo CLI
 
@@ -190,7 +273,8 @@ El archivo `.kilo/kilo.jsonc` configura el MCP. En la TUI, usa `/mcps` para acti
 > ⚠️ El Inspector MCP (`npx @modelcontextprotocol/inspector`) puede solicitar autenticación vía naveador. Si falla, usa la URL directa:
 
 ```bash
-npx @modelcontextprotocol/inspector --cli http://127.0.0.1:8001/mcp --method tools/list
+npx @modelcontextprotocol/inspector --cli http://127.0.0.1:8001/mcp --method tools/list \
+  --header "Authorization: Bearer $MCP_TOKEN"
 ```
 
 Para modo interactivo (navegador):
@@ -205,6 +289,7 @@ npx @modelcontextprotocol/inspector
 mi-mcp/
 ├── server.py              # Servidor MCP principal
 ├── test_client.py         # Tests end-to-end
+├── run-test.sh            # Prueba manual curl (MCP initialize)
 ├── run-inspector.sh       # Inicia HTTP y MCP Inspector para probar ambos transportes
 ├── requirements.txt       # Dependencias
 ├── .env.example           # Template de variables de entorno

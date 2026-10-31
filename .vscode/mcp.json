@@ -1,8 +1,19 @@
 {
-  "mcpServers": {
+  "inputs": [
+    {
+      "type": "promptString",
+      "id": "mcp-token",
+      "description": "Token Bearer del servidor MCP",
+      "password": true
+    }
+  ],
+  "servers": {
     "demo-mcp-server": {
       "type": "http",
-      "url": "http://127.0.0.1:8001/mcp"
+      "url": "http://127.0.0.1:8001/mcp",
+      "headers": {
+        "Authorization": "Bearer ${input:mcp-token}"
+      }
     }
   }
 }
