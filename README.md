@@ -258,6 +258,19 @@ Verifica:
 - ✅ Prompts (list + get)
 - ✅ Completions (prompt + resource template)
 
+## Características MCP obsoletas (no implementadas)
+
+Las siguientes capacidades del protocolo MCP están **deprecadas** o fueron **removidas** de la especificación. Este servidor **no las usa**:
+
+| Característica | Estado | Por qué |
+|---|---|---|
+| HTTP + SSE | Deprecado | Reemplazado por **Streamable HTTP** (más directo, seguro y escalable) |
+| Roots (`roots/list`, `notifications/roots/list_changed`) | Deprecado | Complejidad innecesaria y sin control de acceso estricto |
+| Sampling (`sampling/createMessage`) | Deprecado | Mezcla responsabilidades de inferencia del modelo dentro del protocolo |
+| Logging (`logging/setLevel`, `notifications/message`) | Deprecado | El logging debe gestionarse con sistemas de observabilidad estándar (OpenTelemetry, stdout/stderr) |
+
+Este servidor usa exclusivamente **Streamable HTTP** como transporte y no implementa Roots, Sampling ni Logging a nivel de protocolo.
+
 ## Integración con Clientes MCP
 
 ### VS Code
