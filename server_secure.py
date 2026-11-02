@@ -218,6 +218,20 @@ async def verify_mcp_request(
 
 
 # ---------------------------------------------------------------------------
+# Metadatos del recurso protegido (RFC 9728)
+# ---------------------------------------------------------------------------
+
+@app.get("/.well-known/oauth-protected-resource")
+async def protected_resource_metadata() -> dict[str, Any]:
+    """Metadatos del recurso protegido (RFC 9728)."""
+    return {
+        "resource": EXPECTED_AUDIENCE,
+        "authorization_servers": [OAUTH_ISSUER],
+        "scopes_supported": [REQUIRED_SCOPE],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Endpoint MCP único (POST /mcp)
 # ---------------------------------------------------------------------------
 
