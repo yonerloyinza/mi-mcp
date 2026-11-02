@@ -3,6 +3,7 @@ python-dotenv>=1.2.2
 uvicorn>=0.31.1
 fastapi>=0.104.0
 httpx2>=0.25.0
+python-jose[cryptography]>=3.3.0
 
 # Opcional: base de datos multimedia (MongoDB)
 # motor>=3.3.0
