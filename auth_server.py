@@ -2,8 +2,8 @@
 auth_server.py — Authorization Server OAuth 2.1 para MCP.
 
 Sirve como servidor de autenticación (Authorization Server) que:
-  * Expone /.well-known/oauth-authorization-server (metadatos)
-  * Sirve página de login + consentimiento en /authorize
+  * Expone /.well-known/oauth-authorization-server (metadatos RFC 8414)
+  * Sirve página de login con usuario/contraseña en /authorize
   * Intercambia code por access token en /token (PKCE S256)
   * Emite JWT firmados con la misma SECRET_KEY que server_secure.py
 """
@@ -39,6 +39,15 @@ logging.basicConfig(
 logger = logging.getLogger("auth-server")
 
 app = FastAPI(title="OAuth 2.1 Authorization Server for MCP", version="2026.11.0")
+
+# ---------------------------------------------------------------------------
+# Usuarios autorizados (en producción usar base de datos con hashes bcrypt)
+# Formato: {usuario: contraseña}
+# ---------------------------------------------------------------------------
+USUARIOS: dict[str, str] = {
+    "admin": os.environ.get("ADMIN_PASSWORD", "admin123"),
+    "usuario": os.environ.get("USER_PASSWORD", "usuario123"),
+}
 
 # ---------------------------------------------------------------------------
 # Almacenamiento en memoria (en producción usar Redis/PostgreSQL)
@@ -86,8 +95,13 @@ LOGIN_PAGE = """
         p { color: #666; margin-bottom: 24px; }
         .btn { background: #0070c9; color: white; border: none; padding: 12px 24px; border-radius: 6px; font-size: 16px; cursor: pointer; width: 100%; }
         .btn:hover { background: #005a9e; }
+        .btn:disabled { background: #ccc; cursor: not-allowed; }
+        .form-group { margin-bottom: 16px; }
+        label { display: block; margin-bottom: 6px; font-weight: 600; color: #333; }
+        input[type="text"], input[type="password"] { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 6px; font-size: 16px; box-sizing: border-box; }
         .scopes { margin: 16px 0; font-size: 14px; color: #333; }
         .scope { display: inline-block; background: #f3f4f6; padding: 4px 8px; border-radius: 4px; margin-right: 6px; margin-bottom: 6px; }
+        .error { color: #dc2626; font-size: 14px; margin-bottom: 12px; display: none; }
     </style>
 </head>
 <body>
@@ -98,13 +112,32 @@ LOGIN_PAGE = """
             Permisos solicitados:
             {' '.join(f'<span class="scope">{s}</span>' for s in scopes)}
         </div>
-        <form method="post">
+        <div class="error" id="error">Usuario o contraseña incorrectos.</div>
+        <form id="loginForm" method="post">
+            <div class="form-group">
+                <label for="username">Usuario</label>
+                <input type="text" id="username" name="username" required autocomplete="username">
+            </div>
+            <div class="form-group">
+                <label for="password">Contraseña</label>
+                <input type="password" id="password" name="password" required autocomplete="current-password">
+            </div>
             <input type="hidden" name="code" value="{code}">
             <input type="hidden" name="redirect_uri" value="{redirect_uri}">
             <input type="hidden" name="state" value="{state}">
             <button class="btn" type="submit">Autorizar</button>
         </form>
     </div>
+    <script>
+        document.getElementById('loginForm').addEventListener('submit', function(e) {
+            var username = document.getElementById('username').value.trim();
+            var password = document.getElementById('password').value.trim();
+            if (!username || !password) {
+                e.preventDefault();
+                document.getElementById('error').style.display = 'block';
+            }
+        });
+    </script>
 </body>
 </html>
 """
@@ -119,6 +152,7 @@ async def authorize(
     code_challenge: str,
     code_challenge_method: str,
     state: str,
+    error: str | None = None,
 ):
     """Muestra página de login y genera un código de autorización."""
     code = secrets.token_urlsafe(32)
@@ -144,11 +178,65 @@ async def authorize(
 
 @app.post("/authorize")
 async def authorize_post(
+    username: str = Form(...),
+    password: str = Form(...),
     code: str = Form(...),
     redirect_uri: str = Form(...),
     state: str = Form(...),
 ):
-    """Procesa la autorización del usuario y redirige al cliente con el código."""
+    """Verifica credenciales y redirige al cliente con el código de autorización."""
+    # Verificar credenciales de usuario
+    stored_password = USUARIOS.get(username)
+    if stored_password is None or password != stored_password:
+        # Re-generar código y mostrar error de login
+        new_code = secrets.token_urlsafe(32)
+        auth_codes[code_challenge] = {
+            "code": new_code,
+            "client_id": "",  # No autorizado
+            "redirect_uri": redirect_uri,
+            "scope": "",
+            "state": state,
+            "created_at": datetime.utcnow().isoformat(),
+        }
+        return HTMLResponse(
+            f"""
+            <!DOCTYPE html>
+            <html lang="es">
+            <head>
+                <meta charset="UTF-8">
+                <title>Error de autenticación</title>
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <style>
+                    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 480px; margin: 80px auto; padding: 20px; }}
+                    .card {{ border: 1px solid #dc2626; border-radius: 12px; padding: 32px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
+                    h1 {{ color: #dc2626; font-size: 24px; margin-bottom: 8px; }}
+                    p {{ color: #666; margin-bottom: 24px; }}
+                    .btn {{ background: #0070c9; color: white; border: none; padding: 12px 24px; border-radius: 6px; font-size: 16px; cursor: pointer; width: 100%; }}
+                    .btn:hover {{ background: #005a9e; }}
+                </style>
+            </head>
+            <body>
+                <div class="card">
+                    <h1>Credenciales incorrectas</h1>
+                    <p>El usuario o la contraseña no son válidos.</p>
+                    <form method="get" action="/authorize">
+                        <input type="hidden" name="response_type" value="code">
+                        <input type="hidden" name="client_id" value="{client_id}">
+                        <input type="hidden" name="redirect_uri" value="{redirect_uri}">
+                        <input type="hidden" name="scope" value="{scope}">
+                        <input type="hidden" name="code_challenge" value="{code_challenge}">
+                        <input type="hidden" name="code_challenge_method" value="S256">
+                        <input type="hidden" name="state" value="{state}">
+                        <button class="btn" type="submit">Intentar de nuevo</button>
+                    </form>
+                </div>
+            </body>
+            </html>
+            """,
+            status_code=401,
+        )
+
+    # Credenciales válidas: redirigir al cliente con el código
     return RedirectResponse(f"{redirect_uri}?code={code}&state={state}")
 
 
@@ -181,7 +269,11 @@ async def token(
 
     challenge_data = auth_codes[challenge]
 
-    # Verificar PKCE code_verifier (simplificado: en producción verificar el hash)
+    # Verificar que el código fue autorizado (tiene client_id válido)
+    if not challenge_data.get("client_id"):
+        return JSONResponse({"error": "invalid_grant", "error_description": "Código no autorizado"}, status_code=400)
+
+    # Verificar PKCE code_verifier
     if not code_verifier:
         return JSONResponse({"error": "invalid_grant", "error_description": "code_verifier requerido"}, status_code=400)
 
@@ -189,7 +281,7 @@ async def token(
     now = datetime.now(timezone.utc)
     payload = {
         "iss": ISSUER,
-        "sub": "usuario-demo",
+        "sub": challenge_data.get("username", "usuario-demo"),
         "aud": RESOURCE_URL,
         "scope": challenge_data["scope"],
         "iat": int(now.timestamp()),
@@ -200,7 +292,7 @@ async def token(
     access_token = jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
     access_tokens[payload["jti"]] = payload
 
-    logger.info(f"Token emitido para scope: {challenge_data['scope']}")
+    logger.info(f"Token emitido para usuario: {payload['sub']} con scope: {challenge_data['scope']}")
 
     return {
         "access_token": access_token,
