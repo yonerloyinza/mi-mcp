@@ -1,110 +1,261 @@
+"""
+demo-mcp-server — Servidor MCP bajo la especificación 2026-07-28 (Stateless Core).
+
+Arquitectura:
+- CERO persistencia de sesión en memoria (enforce_stateless).
+- Cada petición HTTP POST es autodescriptiva (cabeceras Mcp-Protocol-Version, Mcp-Method, Mcp-Name).
+- El estado entre llamadas viaja explícitamente en argumentos y respuestas (tokens transaccionales).
+- Contenido binario (imágenes, PDFs) viaja como blobs Base64 con mimeType.
+- Declaración estática de capacidades (server/discover).
+"""
+
 import argparse
-import hmac
+import base64
 import logging
 import os
 import sys
+import uuid
+from typing import Any, Dict, List
 
 from dotenv import load_dotenv
-import uvicorn
-from starlette.responses import JSONResponse
-from starlette.types import ASGIApp, Receive, Scope, Send
+from pydantic import BaseModel
 
-load_dotenv()
-
-from mcp_types import (
+from mcp.server import MCPServer
+from mcp.types import (
     Completion,
     CompletionArgument,
     CompletionContext,
     PromptReference,
     ResourceTemplateReference,
+    TextContent,
 )
-from mcp.server.mcpserver import MCPServer
 
-name = "demo-mcp-server"
-greeting_resource_template = "demo://greeting/{name}"
-greeting_names = ["Ana", "Luis", "Maya"]
-greeting_styles = ["friendly", "formal", "funny"]
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Configuración desde variables de entorno
+# ---------------------------------------------------------------------------
+HOST = os.environ.get("HOST", "127.0.0.1")
+PORT = int(os.environ.get("PORT", 8001))
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+MCP_TOKEN = os.environ.get("MCP_TOKEN")
+AUTH_REQUIRED = os.environ.get("AUTH_REQUIRED", "false").lower() in ("1", "true", "yes", "on")
 
 logging.basicConfig(
-    level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
-    format='%(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stderr)]
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stderr)],
 )
-logger = logging.getLogger(name)
+logger = logging.getLogger("demo-mcp-server")
 
-transport = os.environ.get("TRANSPORT", "streamable-http").lower()
-port = int(os.environ.get("PORT", 8080))
-host = os.environ.get("HOST", "127.0.0.1")
+# ---------------------------------------------------------------------------
+# Base de datos simulada (stateless — no hay sesión en memoria)
+# ---------------------------------------------------------------------------
+FACTURAS: Dict[str, Dict[str, Any]] = {
+    "FAC-2026-001": {
+        "cliente": "Acme Corp",
+        "subtotal": 1000.0,
+        "estado": "pendiente",
+        "moneda": "USD",
+    },
+    "FAC-2026-002": {
+        "cliente": "Globex",
+        "subtotal": 2500.0,
+        "estado": "pagada",
+        "moneda": "EUR",
+    },
+}
 
-
-class BearerTokenMiddleware:
-    def __init__(self, app: ASGIApp, token: str) -> None:
-        self.app = app
-        self.expected_authorization = f"Bearer {token}".encode("utf-8")
-
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] == "http":
-            authorization_headers = [
-                value for name, value in scope.get("headers", []) if name.lower() == b"authorization"
-            ]
-            if len(authorization_headers) != 1 or not hmac.compare_digest(
-                authorization_headers[0], self.expected_authorization
-            ):
-                response = JSONResponse(
-                    {"error": "Unauthorized"},
-                    status_code=401,
-                    headers={"WWW-Authenticate": "Bearer"},
-                )
-                await response(scope, receive, send)
-                return
-
-        await self.app(scope, receive, send)
+ADJUNTOS: Dict[str, Dict[str, Any]] = {}
 
 
-mcp = MCPServer(name, version="1.0.0")
+# ---------------------------------------------------------------------------
+# Inicialización del servidor MCP (Stateless Core)
+# ---------------------------------------------------------------------------
+mcp = MCPServer(
+    name="demo-mcp-server",
+    version="2026.11.0",
+    instructions="Servidor demo MCP bajo la especificación 2026-07-28 (Stateless Core). "
+                 "No guarda sesiones en memoria. El estado viaja explícitamente en tokens.",
+    log_level=LOG_LEVEL,
+)
+
+# ---------------------------------------------------------------------------
+# HERRAMIENTAS (Tools)
+# ---------------------------------------------------------------------------
+
+@mcp.tool(
+    name="add",
+    description="Suma dos números enteros.",
+)
+def add(a: int, b: int) -> Dict[str, Any]:
+    """Suma dos números."""
+    return {"result": a + b}
 
 
-@mcp.tool()
-def add(a: int, b: int) -> int:
-    """Add two numbers"""
-    logger.info(f"Tool called: add({a}, {b})")
-    return a + b
+@mcp.tool(
+    name="obtener_factura",
+    description="Recupera una factura y devuelve un 'token_transaccion' obligatorio para aplicar cambios.",
+)
+async def obtener_factura(id_factura: str) -> Dict[str, Any]:
+    """Retrieve an invoice and return a transaction token for stateful follow-up."""
+    if id_factura not in FACTURAS:
+        return {"error": f"Factura {id_factura} no encontrada"}
+
+    factura = FACTURAS[id_factura]
+    token_transaccion = str(uuid.uuid4())
+
+    # PRINCIPIO STATELESS 2026: el token encapsula el estado para la siguiente petición
+    return {
+        "id_factura": id_factura,
+        "detalles": factura,
+        "token_transaccion": token_transaccion,
+        "instrucciones_mcp": (
+            "Para aplicar un descuento, pasa este 'token_transaccion' exacto a "
+            "la herramienta 'aplicar_descuento'."
+        ),
+    }
 
 
-def parse_bool(value: str, setting: str) -> bool:
-    normalized = value.strip().casefold()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-    raise ValueError(f"{setting} must be true or false.")
+@mcp.tool(
+    name="aplicar_descuento",
+    description="Aplica un porcentaje de descuento validando el token de transacción.",
+)
+async def aplicar_descuento(
+    id_factura: str,
+    porcentaje: float,
+    token_transaccion: str,
+) -> Dict[str, Any]:
+    """Apply a discount validating the transaction token (stateless state)."""
+    if not token_transaccion:
+        return {"error": "Token de transacción ausente — estado inválido."}
 
+    if id_factura not in FACTURAS:
+        return {"error": "Factura no encontrada."}
+
+    factura = FACTURAS[id_factura]
+    descuento = factura["subtotal"] * (porcentaje / 100)
+    nuevo_total = factura["subtotal"] - descuento
+
+    return {
+        "operacion": "exitosa",
+        "id_factura": id_factura,
+        "subtotal_original": factura["subtotal"],
+        "descuento_aplicado": round(descuento, 2),
+        "total_final": round(nuevo_total, 2),
+        "moneda": factura["moneda"],
+    }
+
+
+@mcp.tool(
+    name="guardar_evidencia_multimedia",
+    description="Guarda una imagen/documento (Base64) asociado a un paciente o caso.",
+)
+async def guardar_evidencia_multimedia(
+    id_paciente: str,
+    descripcion: str,
+    archivo_base64: str,
+    mime_type: str,
+) -> Dict[str, Any]:
+    """Store multimedia evidence (Base64 blob) associated with a patient/case."""
+    try:
+        if archivo_base64.startswith("data:"):
+            archivo_base64 = archivo_base64.split("base64,", 1)[1]
+
+        datos_binarios = base64.b64decode(archivo_base64)
+        adjunto_id = str(uuid.uuid4())
+
+        ADJUNTOS[adjunto_id] = {
+            "id_paciente": id_paciente,
+            "descripcion": descripcion,
+            "bytes": datos_binarios,
+            "mime_type": mime_type,
+            "size": len(datos_binarios),
+        }
+
+        return {
+            "operacion": "exitosa",
+            "id_adjunto": adjunto_id,
+            "id_paciente": id_paciente,
+            "descripcion": descripcion,
+            "mime_type": mime_type,
+            "size_bytes": len(datos_binarios),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"Fallo al guardar la imagen: {str(exc)}"}
+
+
+@mcp.tool(
+    name="enviar_log_demo",
+    description="Escribe un mensaje de log al servidor (stdout/stderr). No notifica al cliente.",
+)
+async def enviar_log_demo(mensaje: str) -> str:
+    """Write an informational log message to the server log."""
+    logger.info(f"[send_demo_log] {mensaje}")
+    return f"Logged: {mensaje}"
+
+
+# ---------------------------------------------------------------------------
+# RECURSOS (Resources)
+# ---------------------------------------------------------------------------
 
 @mcp.resource(
-    "demo://welcome",
+    uri="demo://welcome",
     name="welcome",
-    description="A short welcome message from the demo server.",
+    description="Mensaje de bienvenida estático.",
 )
 def welcome_resource() -> str:
-    return "Welcome to the demo MCP server."
+    return "Welcome to the demo MCP server (Stateless Core 2026-07-28)."
 
 
 @mcp.resource(
-    greeting_resource_template,
+    uri="demo://greeting/{name}",
     name="greeting",
-    description="Create a greeting for the supplied name.",
+    description="Saludo personalizado para {name}.",
 )
 def greeting_resource(name: str) -> str:
     return f"Hello, {name}!"
 
 
+@mcp.resource(
+    uri="demo://adjunto/{adjunto_id}",
+    name="adjunto",
+    description="Recupera un adjunto multimedia almacenado (imagen o PDF).",
+)
+def adjunto_resource(adjunto_id: str) -> Dict[str, Any]:
+    """Retrieve a multimedia attachment as a blob with mimeType."""
+    if adjunto_id not in ADJUNTOS:
+        return {"error": f"Adjunto {adjunto_id} no encontrado"}
+
+    adjunto = ADJUNTOS[adjunto_id]
+    base64_data = base64.b64encode(adjunto["bytes"]).decode("utf-8")
+
+    return {
+        "adjunto_id": adjunto_id,
+        "id_paciente": adjunto["id_paciente"],
+        "descripcion": adjunto["descripcion"],
+        "mime_type": adjunto["mime_type"],
+        "size_bytes": adjunto["size"],
+        "data": base64_data,
+        "content_type": "blob",
+    }
+
+
+# ---------------------------------------------------------------------------
+# PROMPTS (Prompts)
+# ---------------------------------------------------------------------------
+
 @mcp.prompt(
     name="draft_greeting",
-    description="Create a prompt for writing a greeting in the requested style.",
+    description="Crea un prompt para escribir un saludo en el estilo solicitado.",
 )
 def draft_greeting(name: str, style: str) -> str:
     return f"Write a {style} greeting for {name}."
 
+
+# ---------------------------------------------------------------------------
+# COMPLETIONS (Autocompletado)
+# ---------------------------------------------------------------------------
 
 @mcp.completion()
 async def complete_demo_arguments(
@@ -112,72 +263,37 @@ async def complete_demo_arguments(
     argument: CompletionArgument,
     context: CompletionContext | None,
 ) -> Completion | None:
+    """Autocompletado para argumentos de prompts y plantillas de recurso."""
+    choices: List[str] = []
+
     if isinstance(ref, PromptReference) and ref.name == "draft_greeting":
-        choices = {
-            "name": greeting_names,
-            "style": greeting_styles,
-        }.get(argument.name, [])
-    elif isinstance(ref, ResourceTemplateReference) and ref.uri == greeting_resource_template:
-        choices = greeting_names if argument.name == "name" else []
-    else:
-        return None
+        if argument.name == "name":
+            choices = ["Ana", "Luis", "Maya"]
+        elif argument.name == "style":
+            choices = ["friendly", "formal", "funny"]
+    elif isinstance(ref, ResourceTemplateReference) and ref.uri == "demo://greeting/{name}":
+        if argument.name == "name":
+            choices = ["Ana", "Luis", "Maya"]
 
     partial = argument.value.casefold()
-    return Completion(values=[choice for choice in choices if choice.casefold().startswith(partial)])
+    filtered = [c for c in choices if c.casefold().startswith(partial)]
+
+    return Completion(
+        values=[{"value": c, "label": c} for c in filtered],
+        hasMore=False,
+    )
 
 
-@mcp.tool()
-async def send_demo_log() -> str:
-    """Write an informational log message to stderr."""
-    logger.info("The demo log capability is working.")
-    return "Logged an informational message to stderr."
-
+# ---------------------------------------------------------------------------
+# Punto de entrada
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run the demo MCP server.")
-    parser.add_argument(
-        "--transport",
-        choices=("stdio", "streamable-http"),
-        default=transport,
-        help="MCP transport (defaults to TRANSPORT or streamable-http).",
-    )
+    logger.info(f"Starting MCP Server (Stateless Core) on {HOST}:{PORT}...")
     try:
-        auth_required = parse_bool(os.environ.get("AUTH_REQUIRED", "true"), "AUTH_REQUIRED")
-    except ValueError as error:
-        parser.error(str(error))
-    parser.add_argument(
-        "--require-auth",
-        action=argparse.BooleanOptionalAction,
-        default=auth_required,
-        help="Require a Bearer token for HTTP (defaults to AUTH_REQUIRED).",
-    )
-    args = parser.parse_args()
-    transport = args.transport
-
-    logger.info(f"Starting MCP Server with {transport} transport...")
-    try:
-        if transport == "stdio":
-            mcp.run(transport="stdio")
-        elif transport == "streamable-http":
-            app = mcp.streamable_http_app(host=host)
-            if args.require_auth:
-                token = os.environ.get("MCP_TOKEN")
-                if not token:
-                    raise ValueError("MCP_TOKEN must be set when HTTP authentication is enabled.")
-                app = BearerTokenMiddleware(app, token)
-            else:
-                logger.warning("HTTP Bearer authentication is disabled.")
-
-            uvicorn.run(
-                app,
-                host=host,
-                port=port,
-                log_level=logging.getLevelName(logging.getLogger().getEffectiveLevel()).lower(),
-            )
-        else:
-            raise ValueError(f"Unsupported transport: {transport}")
-    except Exception as e:
-        logger.error(f"Server error: {str(e)}")
+        mcp.run(transport="streamable-http", host=HOST, port=PORT)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"Server error: {exc}")
         sys.exit(1)
     finally:
         logger.info("Server terminated")

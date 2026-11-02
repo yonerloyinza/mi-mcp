@@ -1,4 +1,13 @@
 mcp==2.3.0
 python-dotenv>=1.2.2
-requests==2.23.0
 uvicorn>=0.31.1
+fastapi>=0.104.0
+httpx2>=0.25.0
+
+# Opcional: base de datos multimedia (MongoDB)
+# motor>=3.3.0
+# pymongo>=4.9.0
+
+# Opcional: pruebas
+# pytest>=8.0.0
+# pytest-asyncio>=0.23.0
